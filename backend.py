@@ -1,10 +1,11 @@
 import streamlit as st
 import pandas as pd
 from supabase import create_client
-import google.generativeai as genai  # <--- 改回使用这个标准库，兼容性最好
+import google.generativeai as genai
 import json
 import time
 import re
+from datetime import date
 
 # --- A. 数据库连接 ---
 @st.cache_resource
@@ -21,7 +22,7 @@ supabase = init_connection()
 def check_google_key():
     return "google" in st.secrets and "api_key" in st.secrets["google"]
 
-# --- C. 核心数据函数 (保持不变) ---
+# --- C. 核心数据函数 ---
 def get_forest_list():
     if not supabase: return []
     try: return supabase.table("dim_forests").select("*").execute().data
@@ -62,21 +63,32 @@ def save_monthly_data(edited_df, table_name, dim_id_col, forest_id, target_date,
     if not supabase or edited_df.empty: return False
     records = []
     for _, row in edited_df.iterrows():
-        rec = { "forest_id": forest_id, dim_id_col: row[dim_id_col], "month": target_date, "record_type": record_type }
+        # 安全处理：确保 ID 存在
+        if dim_id_col not in row or pd.isna(row[dim_id_col]):
+            continue
+
+        rec = { 
+            "forest_id": forest_id, 
+            dim_id_col: int(row[dim_id_col]), 
+            "month": target_date, 
+            "record_type": record_type 
+        }
         for col in row.index:
             if col in ['vol_tonnes', 'vol_jas', 'price_jas', 'amount', 'quantity', 'unit_rate', 'total_amount']:
-                # 找到这一行: rec[col] = row[col]
-                # 改为:
-            try:
-                 rec[col] = float(row[col]) if row[col] is not None else 0.0
-            except:
-                 rec[col] = row[col]
-
+                # 安全转换：将可能的字符串数字转为 float
+                val = row[col]
+                try:
+                    val = float(val) if val is not None else 0.0
+                except:
+                    val = 0.0
+                rec[col] = val
         records.append(rec)
     try:
         supabase.table(table_name).upsert(records, on_conflict=f"forest_id,{dim_id_col},month,record_type").execute()
         return True
-    except: return False
+    except Exception as e:
+        print(f"Save Error: {e}")
+        return False
 
 # --- D. 发票 HTML 生成 ---
 def generate_invoice_html(invoice_no, invoice_date, bill_to, month_str, year, items, subtotal, gst_val, total_due):
@@ -88,32 +100,25 @@ def generate_invoice_html(invoice_no, invoice_date, bill_to, month_str, year, it
     <html><head><style>body {{ font-family: Arial; padding: 20px; }} .invoice-box {{ max-width: 800px; margin: auto; border: 1px solid #eee; padding: 30px; }} table {{ width: 100%; }} .text-right {{ text-align: right; }} .item td {{ border-bottom: 1px solid #eee; }} .total td {{ border-top: 2px solid #eee; font-weight: bold; }}</style></head><body><div class="invoice-box"><table><tr><td><h1>INVOICE</h1></td><td class="text-right">#{invoice_no}<br>{invoice_date}</td></tr><tr><td><strong>FCO Management</strong></td><td class="text-right"><strong>Bill To:</strong><br>{bill_to}</td></tr>{rows_html}<tr class="total"><td></td><td class="text-right">Total: ${total_due:,.2f}</td></tr></table></div></body></html>
     """
 
-# --- E. AI 识别核心逻辑 (稳定兼容版) ---
-# --- 替换 backend.py 中的 real_extract_invoice_data 函数 ---
-
+# --- E. AI 识别核心逻辑 ---
 def real_extract_invoice_data(file_obj):
     try:
         if not check_google_key():
             return [{"vendor_detected": "Error", "error_msg": "API Key missing", "amount_detected": 0, "filename": file_obj.name}]
 
-        # 1. 配置 & 模型选择
         genai.configure(api_key=st.secrets["google"]["api_key"])
         try:
-            model = genai.GenerativeModel('gemini-2.5-flash') 
+            model = genai.GenerativeModel('gemini-2.0-flash') 
         except:
-            model = genai.GenerativeModel('gemini-2.0-flash')
+            model = genai.GenerativeModel('gemini-1.5-flash')
         
-        # 2. 读取文件
         file_obj.seek(0)
         file_bytes = file_obj.read()
         
-        # 3. 构建 Prompt (新增 description 和 invoice_date)
         prompt_text = """
         Analyze this PDF file. It contains MULTIPLE distinct invoices.
         Extract ALL invoices found into a single JSON ARRAY.
-        
-        For each invoice, summarize the work done into a short "description" (e.g., "Road Maintenance", "Aerial Photography", "Log Transport").
-        
+        For each invoice, summarize the work done into a short "description".
         Output format:
         [
             {
@@ -121,23 +126,16 @@ def real_extract_invoice_data(file_obj):
                 "invoice_no": "INV-001",
                 "invoice_date": "YYYY-MM-DD", 
                 "amount_detected": 1000.00,
-                "description": "Brief summary of the service provided"
+                "description": "Brief summary"
             }
         ]
-        
-        Important:
-        1. Scan ALL pages.
-        2. Format dates as YYYY-MM-DD.
-        3. Return ONLY the JSON ARRAY.
         """
         
-        # 4. 调用 AI
         response = model.generate_content([
             {'mime_type': 'application/pdf', 'data': file_bytes},
             prompt_text
         ])
         
-        # 5. 解析结果
         raw_text = response.text
         match = re.search(r'\[.*\]', raw_text, re.DOTALL)
         
@@ -151,26 +149,20 @@ def real_extract_invoice_data(file_obj):
                     
                 for item in data_list:
                     if not isinstance(item, dict): continue
-                    
                     item['filename'] = file_obj.name
-                    
-                    # 容错与默认值填充
                     if "amount_detected" not in item: item["amount_detected"] = 0.0
                     if "invoice_no" not in item: item["invoice_no"] = "Unknown"
                     if "vendor_detected" not in item: item["vendor_detected"] = "Unknown"
-                    if "invoice_date" not in item: item["invoice_date"] = str(date.today()) # 如果没读到日期，暂填今天
+                    if "invoice_date" not in item: item["invoice_date"] = str(date.today())
                     if "description" not in item: item["description"] = "N/A"
                     
-                    # 金额清洗
                     if isinstance(item["amount_detected"], str):
                         clean_amt = item["amount_detected"].replace('$','').replace(',','').strip()
                         try: item["amount_detected"] = float(clean_amt)
                         except: item["amount_detected"] = 0.0
                     
                     final_results.append(item)
-                    
                 return final_results
-                
             except json.JSONDecodeError:
                 return [{"filename": file_obj.name, "vendor_detected": "Error", "error_msg": "JSON Parse Error", "amount_detected": 0}]
         else:
@@ -179,22 +171,17 @@ def real_extract_invoice_data(file_obj):
     except Exception as e:
         return [{"filename": file_obj.name, "vendor_detected": "Error", "error_msg": str(e), "amount_detected": 0}]
 
-
-# --- F 在 backend.py 添加这个调试函数
-
+# --- F. 调试函数 ---
 def list_available_models():
     genai.configure(api_key=st.secrets["google"]["api_key"])
     for m in genai.list_models():
         if 'generateContent' in m.supported_generation_methods:
-            print(m.name) # 这会在 Streamlit 的后台 Logs 里打印出来的模型列表
+            print(m.name)
 
-
-# --- G - GL Mapping Logic ---
+# --- G. GL Mapping Logic ---
 def get_gl_mapping(forest_id):
     """
-    获取指定林地的 GL 映射表，返回两个字典：
-    1. cost_map: {activity_id: {'code': 'GLxxx', 'name': 'Desc'}}
-    2. rev_map:  {grade_id:    {'code': 'GLxxx', 'name': 'Desc'}}
+    获取指定林地的 GL 映射表
     """
     if not supabase: return {}, {}
     

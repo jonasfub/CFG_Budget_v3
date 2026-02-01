@@ -1,0 +1,11 @@
+# 忽略 Streamlit 密钥文件
+.streamlit/secrets.toml
+
+# 忽略系统缓存
+__pycache__/
+*.pyc
+
+# 忽略虚拟环境 (如果你有)
+venv/
+.env
+.DS_Store

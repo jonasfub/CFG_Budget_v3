@@ -1,0 +1,50 @@
+name: Supabase Keep Alive
+
+on:
+  schedule:
+    # 每天 UTC 时间 00:00 运行一次 (北京时间早上8点)
+    - cron: '0 0 * * *'
+  workflow_dispatch: # 允许手动点击运行测试
+
+jobs:
+  ping-database:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install supabase
+
+      - name: Ping Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python -c "
+          import os
+          from supabase import create_client
+          
+          url = os.environ.get('SUPABASE_URL')
+          key = os.environ.get('SUPABASE_KEY')
+          
+          if url and key:
+              supabase = create_client(url, key)
+              # 执行一个极其简单的查询，只为了产生连接记录
+              try:
+                  # 假设你有一个表叫 'dim_forests'，或者随便查一个存在的表
+                  # limit(1) 极小开销
+                  response = supabase.table('dim_forests').select('id').limit(1).execute()
+                  print('✅ Ping successful! Database is active.')
+              except Exception as e:
+                  print(f'❌ Ping failed: {e}')
+          else:
+              print('❌ Secrets not found!')
+          "
